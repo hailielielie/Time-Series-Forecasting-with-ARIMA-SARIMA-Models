@@ -25,5 +25,5 @@ The report shows how to identify time series characteristics, fit models, evalua
 ## Repository Structure
 - `Time-Series-Project.qmd` → Quarto source file  
 - `index.html` → rendered report (deployed via GitHub Pages)  
-- `*_files/` → images and dependencies generated during rendering  
+- `Time-Series-Project_files` → images and dependencies generated during rendering  
 - `README.md` → project overview  
