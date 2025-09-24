@@ -1,0 +1,497 @@
+---
+title: "Time Series Forecasting with ARIMA and SARIMA Models"
+subtitle: "Applications to S&P 500 Returns and J&J Quarterly EPS"
+author: "Van Anh Pham"
+documentclass: article
+papersize: letter
+block-headings: true
+---
+
+## **1. Project Goal & Datasets**
+
+**Goal**: The objective is to construct a clear and systematic pipeline for time series forecasting using both ARIMA (non-seasonal) and SARIMA (seasonal) models. The pipeline follows the standard stages of identification, estimation, diagnostic checking, and forecasting.
+
+**Datasets:**
+Two complementary financial time series are considered:
+
+-   **ARIMA model:** Monthly log-returns of the S&P 500 index (`^GSPC`, retrieved from Yahoo Finance via the *quantmod* package). Since log-returns are approximately stationary, they are well suited for ARIMA modeling.
+
+-   **SARIMA model:** Quarterly earnings per share (EPS) of Johnson & Johnson (`JohnsonJohnson`, available as a built-in dataset in R). The series exhibits pronounced quarterly seasonality, making it an appropriate candidate for SARIMA modeling with seasonal differencing.
+
+```{r}
+#| warning: false
+#| message: false
+#| echo: true
+need <- function(pkgs){
+to_install <- pkgs[!pkgs %in% installed.packages()[,1]]
+if(length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+invisible(lapply(pkgs, require, character.only = TRUE))
+}
+need(c("forecast","tseries","ggplot2","quantmod"))
+```
+
+```{r}
+mode <- "both" # choose: "arima", "sarima", or "both"
+```
+
+## 2. Data Preparation
+
+### 2.1  Load ARIMA dataset (S&P 500 log-returns)
+
+For the ARIMA model we use monthly log-returns of the S&P 500 index, retrieved from Yahoo Finance through the *quantmod* package. Working with returns instead of price levels is standard in finance because stock prices usually follow a non-stationary process, often with a unit root. Log-returns, on the other hand, tend to be stationary and do not show long-term trends or seasonality, which makes them suitable for ARIMA analysis.
+
+```{r}
+get_gspc <- function(){
+suppressMessages(getSymbols(Symbols = "^GSPC", src = "yahoo", from = "1990-01-01", auto.assign = FALSE))
+}
+Y_arima <- NULL
+if(mode %in% c("arima","both")){
+xts_g <- try(get_gspc(), silent = TRUE)
+if(!inherits(xts_g, "try-error")){
+G_m <- to.monthly(xts_g, indexAt = "lastof", OHLC = FALSE)
+P <- Ad(G_m)
+R <- diff(log(P))
+R <- na.omit(R)
+sy <- as.numeric(format(zoo::index(R)[1], "%Y"))
+sm <- as.numeric(format(zoo::index(R)[1], "%m"))
+Y_arima <- ts(as.numeric(R), frequency = 12, start = c(sy, sm))
+attr(Y_arima, "label") <- "S&P 500 monthly log-returns"
+}
+}
+```
+
+### 2.2  Load SARIMA dataset (Johnson & Johnson EPS)
+
+For the SARIMA model we use Johnson & Johnson\'s quarterly earnings per share (EPS), provided as the built-in `JohnsonJohnson` dataset in R. Unlike returns, this series shows a clear seasonal pattern linked to quarterly reporting. To handle this, we need seasonal differencing in addition to the usual differencing step. This makes the series a good example for applying SARIMA, which extends ARIMA by including seasonal components.
+
+```{r}
+Y_sarima <- NULL
+if(mode %in% c("sarima","both")){
+Y_sarima <- JohnsonJohnson # quarterly EPS
+attr(Y_sarima, "label") <- "Johnson & Johnson quarterly EPS"
+}
+```
+
+## 3. Helper Functions
+
+We define three small utilities used throughout the workflow:
+
+1.  **Error metrics (`mape`, `rmse`)** --- quick functions to evaluate forecast accuracy. `MAPE` reports average percent error; it\'s easy to read but can blow up when actual values are near zero. `RMSE` is in the same units as the data and penalizes large errors more heavily.
+
+2.  **Time-aware split (`do_split`)** --- splits a univariate time series into a training window and a terminal validation block, preserving order (no shuffling).
+
+3.  **Compact SARIMA search (`fit_best_sarima`)** --- does a small grid search around pre-chosen differencing orders `(d, D)` and picks the model with the lowest AICc. This keeps the search focused (fast) while still exploring AR/MA and seasonal AR/MA combinations that usually matter.
+
+```{r}
+mape <- function(actual, pred) mean(abs((actual - pred)/actual), na.rm = TRUE)*100 # Mean Absolute Percentage Error (%).
+rmse <- function(actual, pred) sqrt(mean((actual - pred)^2, na.rm = TRUE)) # Root Mean Squared Error (same units as 'actual')
+
+# Splits the series into:
+# - train: all observations up to the last 'valid_size' points
+# - valid: the last 'valid_size' observations (ordered, no shuffle)
+do_split <- function(Y, valid_size){
+n <- length(Y); stopifnot(valid_size < n)
+Y_tr <- window(Y, end = time(Y)[n - valid_size])
+Y_va <- window(Y, start = time(Y)[n - valid_size + 1])
+list(train = Y_tr, valid = Y_va) 
+}
+
+# Given suggested differencing orders 'd_sugg' and 'D_sugg' (from identification),
+# search a small grid of AR/MA (p, q) and seasonal AR/MA (P, Q) terms.
+# Choose the model with the smallest AICc.
+fit_best_sarima <- function(Y, d_sugg, D_sugg){
+  ps <- 0:2; qs <- 0:2; 
+  Ps <- ifelse(frequency(Y)>1, 0:1, 0); 
+  Qs <- ifelse(frequency(Y)>1, 0:1, 0)  
+  # Only allow seasonal terms if the series has frequency > 1
+best <- list(aicc = Inf)
+
+for(p in ps) for(q in qs) for(P in Ps) for(Q in Qs){
+  # Skip the all-zero AR/MA case; with differencing it often collapses to a trivial model
+  if(p==0 && q==0 && P==0 && Q==0) next
+fit <- try(Arima(
+  Y, 
+  order = c(p, d_sugg, q), 
+  seasonal = c(P, D_sugg, Q), 
+  include.constant = TRUE), 
+  silent=TRUE)
+
+if(inherits(fit, "try-error")) next
+
+if(!is.na(fit$aicc) && fit$aicc < best$aicc){
+best <- list(
+  fit=fit, 
+  aicc=fit$aicc, 
+  order=c(p,d_sugg,q), 
+  seasonal=c(P,D_sugg,Q)
+  )
+}
+}
+best
+}
+```
+
+## 4. ARIMA Pipeline (on Returns)
+
+*Run this section if `mode` is `"arima"`or `"both"`*.
+
+### 4.1  Explore & Visualize
+
+```{r}
+stopifnot(!is.null(Y_arima))
+label <- attr(Y_arima, "label")
+ar_df <- data.frame(t = as.numeric(time(Y_arima)), y = as.numeric(Y_arima))
+
+library(ggplot2)
+ggplot(ar_df, aes(t, y)) + geom_line(linewidth = 0.6) +
+labs(title = label, x = "Year", y = "Log-returns")
+```
+
+**Figure.** Monthly log-returns of the S&P 500 index.
+
+The series fluctuates around zero with no clear trend or seasonality, consistent with the stationarity assumption required for ARIMA modeling. Occasional large spikes correspond to periods of market stress (e.g., 2008 financial crisis, 2020 COVID-19 shock), but overall the series is stable in mean and variance.
+
+### 4.2  Stationarity Checks
+
+We apply the Augmented Dickey--Fuller (ADF) test (H₀: unit root, i.e., non-stationary) and the KPSS test (H₀: level stationarity). For asset returns, we expect ADF to reject the unit root (small p-value) and KPSS to *not* reject stationarity (large p-value).
+
+```{r}
+adf.test(Y_arima)
+kpss.test(Y_arima, null = "Level") 
+```
+
+-   **ADF:** statistic = −6.37, lag = 7, **p-value \< 0.01** **→** Reject H₀ of a unit root.
+
+-   **KPSS (level):** statistic = 0.116, truncation lag = 5, **p-value \> 0.10** → Fail to reject H₀ of stationarity.
+
+The two tests point the same way: the return series is stationary in levels. No additional differencing is required for ARIMA (i.e., set **d = 0**). Since the plot shows no repeating seasonal pattern in returns, seasonal differencing is also unnecessary (**D = 0**).
+
+### 4.3  Identification (ACF/PACF)
+
+We inspect ACF/PACF of the (already stationary) series to suggest AR/MA orders.
+
+```{r}
+stopifnot(!is.null(Y_arima))
+
+library(forecast)
+library(gridExtra)
+lag_max <- min(40, length(Y_arima) - 1)
+p_acf <- ggAcf(Y_arima, lag.max = lag_max) + ggtitle("ACF (returns)")
+p_pacf <- ggPacf(Y_arima, lag.max = lag_max) + ggtitle("PACF (returns)")
+
+gridExtra::grid.arrange(p_acf, p_pacf, ncol = 2)
+```
+
+The plots show that most autocorrelations fall within the 95% confidence bands, with only a few small spikes at low lags. There is no clear seasonal pattern and no strong persistence in either the ACF or PACF. This suggests that the series can be modeled with very low-order ARMA terms. Candidate models include ARIMA(0,0,0) with a constant, ARIMA(1,0,0), ARIMA(0,0,1), or ARIMA(1,0,1), to be compared using AICc and residual checks.
+
+### 4.4  Train/Validation Split & Baselines
+
+We split the return series into a training set and a 24-month validation set using the helper function `do_split()`. Two simple benchmark forecasts were then computed:
+
+-   **Naive forecast:** each forecast equals the last observed value.
+
+-   **Mean forecast:** each forecast equals the historical average of the training set.
+
+These serve as baseline models to compare with ARIMA forecasts.
+
+```{r}
+valid_size <- 24
+spl <- do_split(Y_arima, valid_size)
+Y_tr <- spl$train; Y_va <- spl$valid
+
+
+fc_naive <- naive(Y_tr, h = length(Y_va))
+fc_mean <- meanf(Y_tr, h = length(Y_va))
+bl <- data.frame(Model=c("Naive","Mean"),
+MAPE=c(mape(Y_va, fc_naive$mean), mape(Y_va, fc_mean$mean)),
+RMSE=c(rmse(Y_va, fc_naive$mean), rmse(Y_va, fc_mean$mean)))
+bl
+```
+
+Both benchmarks perform poorly, which is expected for stock return forecasting. The mean forecast is noticeably better than the naive forecast (lower MAPE and RMSE), and will serve as the baseline to beat for ARIMA models.
+
+### 4.5  Model Selection (AICc) & Diagnostics
+
+Since the return series is already stationary (**d = 0, D = 0**), we searched over a compact grid of AR and MA orders using AICc as the selection criterion. This procedure ensures we find a parsimonious model without overfitting.
+
+```{r}
+d_sugg <- 0
+D_sugg <- 0
+best_arima <- fit_best_sarima(Y_tr, d_sugg, D_sugg)
+best_arima$order; best_arima$seasonal; best_arima$aicc
+```
+
+-   Best model by AICc: **ARIMA(1,0,2)** (no seasonal terms).
+
+-   AICc = **−1390.43**, the lowest among the candidate models.
+
+The chosen specification suggests that the series is best captured by a first-order autoregressive term and two moving-average terms, with no seasonal component. This is consistent with the earlier ACF/PACF inspection, which pointed to a low-order ARMA structure.
+
+```{r}
+checkresiduals(best_arima$fit) # Ljung–Box + residual ACF
+```
+
+-   **Time plot:** residuals fluctuate around zero with no obvious structure.
+
+-   **Residual ACF:** most autocorrelations lie within the 95% bounds → no strong remaining dependence.
+
+-   **Histogram/Normal fit:** residuals are roughly centered at zero and approximately symmetric, though heavy tails are visible (common in financial returns).
+
+-   **Ljung--Box test:** Q = 19.29 (df = 21), p = 0.57 → fail to reject the null of white noise.
+
+The **ARIMA(1,0,2)** model adequately captures the linear dependence in the return series. Residuals behave like white noise, satisfying the key diagnostic checks. However, the presence of heavy tails suggests possible volatility clustering, which ARIMA does not address. For a more refined analysis, a GARCH-type model could be considered to model the conditional variance.
+
+### 4.6  Validation Forecast & Error
+
+We generated out-of-sample forecasts for the 24-month validation period using the selected **ARIMA(1,0,2)** model. Forecast accuracy was assessed with MAPE and RMSE.
+
+```{r}
+fc_val <- forecast(best_arima$fit, h = length(Y_va))
+va_mape <- mape(Y_va, fc_val$mean)
+va_rmse <- rmse(Y_va, fc_val$mean)
+va_mape; va_rmse
+```
+
+The **ARIMA(1,0,2)** model performs better than the naive baseline (**MAPE ≈ 259, RMSE ≈ 0.076**) and slightly better than the mean forecast (**MAPE ≈ 95, RMSE ≈ 0.036**). While RMSE shows an improvement, MAPE remains very high, reflecting the well-known difficulty of predicting asset returns. Overall, the ARIMA model captures some short-term dynamics but does not yield highly accurate forecasts in economic terms.
+
+```{r}
+autoplot(fc_val) + autolayer(Y_va, series = "Actual") + ggtitle("ARIMA validation: forecast vs actual")
+```
+
+**Figure X.** ARIMA validation forecast versus actual returns.
+
+The red line shows the model forecast for the 24-month validation period, with blue bands indicating 80% and 95% prediction intervals. Actual returns (black) fluctuate widely and often fall inside the prediction bands, but point forecasts remain close to zero. This highlights that while the model captures overall variability, individual return movements are essentially unpredictable.
+
+### 4.7  Refit on Full Data & Multi-step Forecast
+
+Using the ARIMA orders selected on the training set, we refit the model on the entire return series to leverage all available information:
+
+```{r}
+fit_final <- Arima(Y_arima, order = best_arima$order, seasonal = best_arima$seasonal)
+fc <- forecast(fit_final, h = 12)
+
+start_fc <- time(fc$mean)[1]
+end_fc   <- time(fc$mean)[length(fc$mean)]
+t0       <- tail(time(Y_arima), 120)[1]   # show last ~10 years (120 months)
+
+autoplot(fc) +
+  geom_vline(xintercept = start_fc, linetype = "dashed") +
+  autolayer(fitted(fit_final), series = "Fitted", size = 0.6, alpha = 0.8) +
+  autolayer(fc$mean,         series = "Forecast", size = 1.1) +
+  labs(title = "ARIMA final forecast (12 months)", y = "Log-returns") +
+  theme_minimal(base_size = 12)
+
+```
+
+**Figure X.** ARIMA(1,0,2) 12-month ahead forecast.\
+
+The black line shows the full history of monthly S&P 500 log-returns, while the shaded region represents forecasts for the next 12 months. The point forecast (center of the band) remains close to zero, consistent with returns having no predictable trend. The 80% and 95% prediction intervals are wide, reflecting substantial uncertainty: the model is more informative about the range of possible outcomes than the exact path of future returns.
+
+## 5. SARIMA Pipeline (on Seasonal EPS)
+
+*Run this section if `mode` is `"sarima"` or `"both"`.*
+
+### 5.1  Explore & Visualize
+
+```{r}
+stopifnot(!is.null(Y_sarima))
+label <- attr(Y_sarima, "label")
+stl_obj <- stl(Y_sarima, s.window = "periodic")
+stl_df <- data.frame(
+t = as.numeric(time(Y_sarima)),
+y = as.numeric(Y_sarima),
+trend = stl_obj$time.series[,"trend"],
+seasonal = stl_obj$time.series[,"seasonal"],
+remainder = stl_obj$time.series[,"remainder"]
+)
+
+# Level plot
+library(ggplot2)
+ggplot(stl_df, aes(t, y)) + geom_line(linewidth = 0.6) +
+labs(title = label, x = "Year", y = "EPS")
+```
+
+We begin by decomposing the Johnson & Johnson quarterly EPS with STL, which reveals a smooth upward trend and strong, regular quarterly seasonality. The level plot confirms non-stationarity in both trend and seasonality, motivating a SARIMA approach with seasonal differencing (**m = 4**). Subsequent tests and ACF/PACF will be performed on the differenced series.
+
+```{r}
+stl_df <- data.frame(
+  t         = as.numeric(time(Y_sarima)),
+  y         = as.numeric(Y_sarima),
+  trend     = as.numeric(stl_obj$time.series[, "trend"]),
+  seasonal  = as.numeric(stl_obj$time.series[, "seasonal"]),
+  remainder = as.numeric(stl_obj$time.series[, "remainder"])
+)
+
+ggplot(stl_df, aes(t, trend)) +
+  geom_line(linewidth = 0.6) +
+  labs(title = "STL Trend", x = "Year", y = NULL)
+
+```
+
+**Figure.** STL trend component of Johnson & Johnson quarterly EPS, 1960--1980.
+
+The series shows strong long-term growth with an accelerating upward slope through the 1970s, confirming the need for differencing in SARIMA modeling.
+
+```{r}
+ggplot(stl_df, aes(t, seasonal)) + geom_line(linewidth = 0.6) +
+labs(title = "STL Seasonal", x = "Year", y = NULL)
+```
+
+**Figure**. STL seasonal component of Johnson & Johnson quarterly EPS.
+
+The decomposition reveals a stable quarterly pattern repeating every four quarters, confirming strong seasonality and the need for a SARIMA model with seasonal differencing.
+
+```{r}
+ggplot(stl_df, aes(t, remainder)) + geom_line(linewidth = 0.6) +
+labs(title = "STL Remainder", x = "Year", y = NULL)
+```
+
+**Figure**. STL remainder of Johnson & Johnson quarterly EPS.
+
+The residual component is mostly noise around zero, but volatility increases markedly in the late 1970s, with large shocks that may limit the precision of SARIMA forecasts.
+
+### 5.2 Stationarity & Differencing Suggestions
+
+We use `ndiffs` (non-seasonal) and `nsdiffs` (seasonal) to suggest \\(d\\) and \\(D\\).
+
+```{r}
+adf.test(Y_sarima)
+
+```
+
+```{r}
+kpss.test(Y_sarima, null = "Level")
+```
+
+We ran ADF (H₀: unit root) and KPSS (H₀: level stationarity) on the J&J EPS level series.
+
+-   **ADF:** DF = 1.93, p ≈ 0.99 → fail to reject unit root (series is non-stationary).
+
+-   **KPSS (level):** stat = 1.98, p \< 0.01 → reject stationarity.
+
+Both unit-root tests and the automatic rules agree: the series needs one seasonal difference and one non-seasonal difference. This matches the strong quarterly pattern and upward trend seen in the STL plots.
+
+```{r}
+d_sugg <- ndiffs(Y_sarima)
+D_sugg <- nsdiffs(Y_sarima)
+c(d_sugg = d_sugg, D_sugg = D_sugg, m = frequency(Y_sarima))
+```
+
+The Johnson & Johnson EPS series requires **SARIMA with (d = 1, D = 1, m = 4)**. In practice, you\'ll work with models of the form: SARIMA(p,1,q)×(P,1,Q)4
+and select the specific AR/MA orders `(p,q,P,Q)` by inspecting ACF/PACF and comparing AICc across candidates.
+
+### 5.3 Identification (ACF/PACF of differenced series)
+
+We difference the EPS series with **d = 1** and **D = 1 (m = 4)**, then inspect ACF/PACF to choose (p,q)×(P,Q)4.
+
+```{r}
+library(forecast)
+library(gridExtra)
+
+Y_diff <- diff(Y_sarima, differences = d_sugg)
+if (D_sugg > 0) Y_diff <- diff(Y_diff, lag = frequency(Y_sarima), differences = D_sugg)
+
+lag_max <- min(40, length(na.omit(Y_diff)) - 1)
+p_acf  <- ggAcf(na.omit(Y_diff), lag.max = lag_max)  + ggtitle("ACF (diffed)")
+p_pacf <- ggPacf(na.omit(Y_diff), lag.max = lag_max) + ggtitle("PACF (diffed)")
+
+gridExtra::grid.arrange(p_acf, p_pacf, ncol = 2)
+```
+
+The ACF shows a strong negative spike at lag 1 and at the seasonal lag 4, while the PACF also drops sharply at lag 1. This pattern points to a non-seasonal MA(1) and a seasonal MA(1), making **SARIMA(0,1,1)×(0,1,1)4** the leading candidate model.
+
+### 5.4  Train/Validation, Baselines, Selection & Diagnostics
+
+We split J&J EPS into a training set and an 8-quarter validation set. Two baseline forecasts were computed:
+
+-   **Naive:** repeats the last observed value.
+
+-   **Seasonal naive:** repeats the value from the same quarter last year (lag 4).
+
+We then searched a compact SARIMA grid around the suggested differencing orders **d = 1**, **D = 1 (m = 4)** and selected the model with the lowest AICc.
+
+```{r}
+valid_size <- 8 # two years of quarters
+spl <- do_split(Y_sarima, valid_size)
+Y_tr <- spl$train; Y_va <- spl$valid
+
+fc_naive <- naive(Y_tr, h = length(Y_va))
+fc_snaive <- snaive(Y_tr, h = length(Y_va))
+bl <- data.frame(Model=c("Naive","Seasonal Naive"),
+MAPE=c(mape(Y_va, fc_naive$mean), mape(Y_va, fc_snaive$mean)),
+RMSE=c(rmse(Y_va, fc_naive$mean), rmse(Y_va, fc_snaive$mean)))
+bl
+```
+
+The seasonal naive forecast clearly outperforms the plain naive, with much lower MAPE (**17.9 vs. 33.8**) and RMSE (**2.78 vs. 5.28**). This confirms the importance of quarterly seasonality in the J&J EPS series.
+
+```{r}
+best_sarima <- fit_best_sarima(Y_tr, d_sugg, D_sugg)
+best_sarima$order; best_sarima$seasonal; best_sarima$aicc
+
+```
+
+The selected model is **SARIMA(0,1,1) × (0,1,0)4**​ with **AICc = 78.6**. This captures both the trend (via **d = 1**) and quarterly seasonality (via **D = 1**), with a simple **MA(1)** term for short-run dynamics.
+
+```{r}
+checkresiduals(best_sarima$fit)
+```
+
+-   The **residuals** fluctuate around zero with no clear structure.
+
+-   The **residual ACF** indicates that autocorrelations are small and within the 95% bounds, suggesting no remaining linear dependence.
+
+-   The **histogram of residuals** is approximately symmetric around zero, though a few outliers are visible.
+
+-   The **Ljung--Box test** yields Q*=2.93 with 7 degrees of freedom and p-value = 0.89, so we fail to reject the null of white noise.
+
+The diagnostics confirm that the **SARIMA(0,1,1)×(0,1,0)4**​ adequately captures the dependence in the series, leaving residuals that are consistent with white noise.
+
+### 5.5  Validation Forecast & Final Model
+
+We generate 8-quarter ahead forecasts from the selected **SARIMA(0,1,1)×(0,1,0)**4​ model and evaluated them against the validation set.
+
+```{r}
+fc_val <- forecast(best_sarima$fit, h = length(Y_va))
+va_mape <- mape(Y_va, fc_val$mean); va_rmse <- rmse(Y_va, fc_val$mean)
+va_mape; va_rmse
+
+```
+
+**SARIMA(0,1,1)×(0,1,0)4**​ outperforms both naïve and seasonal naïve baselines on the validation set, with **MAPE ≈ 5.0** and **RMSE ≈ 0.84**.
+
+```{r}
+autoplot(fc_val) + autolayer(Y_va, series = "Actual") + ggtitle("SARIMA validation: forecast vs actual")
+```
+
+**Figure.** SARIMA validation forecast versus actual EPS.\
+
+The black line shows the historical Johnson & Johnson quarterly EPS, while the shaded region represents the 8-quarter validation forecast with 80% and 95% prediction intervals. The red line (actual) tracks closely with the model forecasts, with nearly all observations falling inside the prediction intervals. This confirms the good fit seen in the error metrics (**MAPE ≈ 5.0, RMSE ≈ 0.84**), and highlights the model\'s ability to capture both the growth trend and quarterly seasonality.
+
+```{r}
+fit_final <- Arima(Y_sarima, order = best_sarima$order, seasonal = best_sarima$seasonal)
+H <- 8
+fc <- forecast(fit_final, h = H)
+autoplot(fc) + ggtitle("SARIMA final forecast (8 quarters)")
+```
+
+**Figure.** Final **SARIMA(0,1,1)×(0,1,0)4**​ 8-quarter forecast.\
+
+The black line shows the full Johnson & Johnson EPS history, while the shaded region represents the 8-quarter ahead forecast. The point forecasts continue the upward trajectory with regular seasonal oscillations, and the prediction intervals widen modestly, reflecting forecast uncertainty. This result indicates that the SARIMA model effectively captures both the long-term growth trend and quarterly seasonality of EPS, while still acknowledging the inherent uncertainty in future values.
+
+## 6. Limitations and Future Work
+
+This project showed how ARIMA and SARIMA can be used step by step for forecasting, and the models did a decent job at capturing the main features of the data: stationarity in returns and strong quarterly seasonality in EPS. However, there are some clear limits. These models are linear, so they cannot deal well with volatility clustering, sudden structural breaks, or other non-linear behavior that is common in financial and economic series. Forecast accuracy also falls off quickly at longer horizons, especially for stock returns where movements are largely unpredictable. Another limitation is that the models only focused on the mean of the series; volatility patterns were left out, and no external information (like macroeconomic indicators or firm fundamentals) was included.
+
+Future work could try to fill these gaps. One obvious step would be to combine ARIMA/SARIMA with GARCH models to capture volatility. Another would be to bring in exogenous variables with ARIMAX or SARIMAX to see if forecasts improve with extra information. Non-linear and machine learning approaches, such as neural networks, could also be explored to capture more complex patterns. It would also be useful to test forecasts in a rolling-window setup rather than one fixed train/validation split, and to extend the analysis to multivariate models so that related series can be modeled together.
+
+## 7. Reproducibility Notes
+
+When using `quantmod` to pull market data (e.g., S&P 500), results may change over time as new observations are added. To ensure reproducibility, export a cached dataset (e.g., CSV) and commit it to your repository.
+
+```{r cache-example, eval=FALSE}
+write.csv(cbind(Date = zoo::index(R), Return = as.numeric(R)), "sp500_monthly_returns.csv", row.names = FALSE)
+# Later: read.csv(...) and ts(..., frequency = 12, start = c(YYYY, MM))
+```
+
+If modeling price **levels** rather than returns, a log or Box--Cox transform is recommended to stabilize variance, and differencing (d \> 0) will typically be required. For seasonal monthly data, `nsdiffs` may suggest one seasonal difference (D = 1, m = 12).
