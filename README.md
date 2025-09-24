@@ -9,7 +9,7 @@ I applied **ARIMA** and **SARIMA** to two different datasets:
 The report shows how to identify time series characteristics, fit models, evaluate diagnostics, and generate forecasts.
 
 ## Live Report
-[View the interactive HTML report](https://<YOUR_USER>.github.io/time-series-forecasting-arima-sarima/)
+[View the interactive HTML report](https://hailielielie.github.io/Times Series Project/)
 
 ## Tools & Technologies
 - **Quarto** → for literate programming and publishing  
