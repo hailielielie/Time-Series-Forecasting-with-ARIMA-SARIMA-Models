@@ -2,9 +2,16 @@
 title: "Time Series Forecasting with ARIMA and SARIMA Models"
 subtitle: "Applications to S&P 500 Returns and J&J Quarterly EPS"
 author: "Van Anh Pham"
-documentclass: article
-papersize: letter
-block-headings: true
+format:
+  html:
+    toc: true
+    code-fold: show
+    code-tools: true
+    highlight-style: kate
+    theme: cosmo
+    smooth-scroll: true
+    anchor-sections: true
+    embed-resources: false  
 ---
 
 ## **1. Project Goal & Datasets**
